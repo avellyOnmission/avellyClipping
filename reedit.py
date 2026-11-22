@@ -1,0 +1,146 @@
+"""Native saved-clip editing. Never download, discover moments or invoke ASR here."""
+import json
+import math
+import threading
+import time
+import uuid
+from pathlib import Path
+from fastapi import HTTPException
+
+CHANGE_KEYS = {'layout','top','cam','game','caption_style','caption_y','captions','hook','title','post_caption','resolution'}
+
+def read_record(data, file):
+    if not isinstance(file,str) or not file.isalnum():
+        raise HTTPException(400,'Choose a saved clip.')
+    path=data/(file+'.json')
+    if not path.exists(): raise HTTPException(404,'Saved clip not found.')
+    record=json.loads(path.read_text(encoding='utf-8'))
+    if record.get('result',{}).get('status')!='done':
+        raise HTTPException(400,'This clip has not finished exporting.')
+    return record
+
+def saved_words(data, file, record):
+    settings=record.get('settings',{})
+    if isinstance(settings.get('words'),list): return settings['words']
+    # Recover old exports' existing SRT instead of silently transcribing again.
+    path=data/(file+'.srt')
+    if not path.exists():
+        if record.get('result',{}).get('caption_words',0):
+            raise HTTPException(409,'No saved subtitles for this older clip. Import its SRT or generate subtitles once.')
+        return []
+    def seconds(value):
+        h,m,s=value.replace(',','.').split(':');return int(h)*3600+int(m)*60+float(s)
+    words=[]
+    for block in path.read_text(encoding='utf-8-sig').strip().split('\n\n'):
+        lines=block.splitlines()
+        if len(lines)<3 or '-->' not in lines[1]:continue
+        a,b=lines[1].split('-->');a,b=seconds(a.strip()),seconds(b.strip())
+        tokens=' '.join(lines[2:]).split()
+        for i,text in enumerate(tokens):
+            words.append({'start':a+(b-a)*i/len(tokens),'end':a+(b-a)*(i+1)/len(tokens),'text':text})
+    return words
+
+def attach(app,data,state,probe,export,save):
+    # Legacy batches can be recovered from their persisted job records.
+    def group_map():
+        mapping={}
+        for path in data.glob('*.state.json'):
+            try:
+                record=json.loads(path.read_text(encoding='utf-8'))
+                for clip in record.get('clips',[]):
+                    if clip.get('file'):
+                        mapping[clip['file']]={'batch_id':path.name.split('.')[0],
+                            'source_url':record.get('source',{}).get('url') or record.get('url','')}
+            except (ValueError,OSError):pass
+        return mapping
+
+    def metadata(file,record,groups=None):
+        settings=record['settings'];legacy=(groups or group_map()).get(file,{})
+        return {'batch_id':settings.get('batch_id') or legacy.get('batch_id') or record.get('source'),
+                'source_url':settings.get('source_url') or legacy.get('source_url','')}
+
+    app.reedit_metadata=metadata
+    app.reedit_groups=group_map
+
+    @app.get('/clips/{file}/edit')
+    def editor(file:str):
+        record=read_record(data,file);settings=record['settings'];source=record['source']
+        if not source.isalnum() or not (data/(source+'.mp4')).exists():
+            raise HTTPException(409,'Original source is unavailable. Restore it to edit this clip without downloading again.')
+        return {'file':file,'settings':{**settings,'words':saved_words(data,file,record)},
+                'source':{'id':source,**probe(data/(source+'.mp4'))},**metadata(file,record)}
+
+    @app.post('/clips/reedit')
+    def apply(body:dict):
+        anchor=str(body.get('file',''));base=read_record(data,anchor)
+        changes=body.get('changes',{})
+        if not isinstance(changes,dict) or set(changes)-CHANGE_KEYS:
+            raise HTTPException(400,'Choose supported layout or caption settings.')
+        groups=group_map();meta=metadata(anchor,base,groups)
+        files=body.get('files')
+        if files is None:
+            files=[anchor]
+            if body.get('scope')=='video':
+                files=[]
+                for path in data.glob('*.json'):
+                    if path.name.endswith(('.state.json','.words.json','.request.json')):continue
+                    try:
+                        record=read_record(data,path.stem)
+                        if record.get('superseded_by'):continue
+                        candidate=metadata(path.stem,record,groups)
+                        if (meta['source_url'] and candidate['source_url']==meta['source_url']) or (not meta['source_url'] and candidate['batch_id']==meta['batch_id']):files.append(path.stem)
+                    except (HTTPException,ValueError,OSError,KeyError):pass
+        if not isinstance(files,list) or not files or len(files)>100 or any(not isinstance(x,str) for x in files):
+            raise HTTPException(400,'Select between 1 and 100 saved clips.')
+        files=list(dict.fromkeys(files));prepared=[]
+        for file in files:
+            record=read_record(data,file);settings=dict(record['settings'])
+            settings.update(changes)
+            # Each clip keeps its own transcript, title, hook and timing in a batch.
+            if len(files)>1:
+                for key in ('title','hook','post_caption'):settings[key]=record['settings'].get(key,'')
+            settings['words']=saved_words(data,file,record)
+            if file==anchor and 'words' in body:
+                if not isinstance(body['words'],list):raise HTTPException(400,'Invalid subtitle words.')
+                settings['words']=body['words']
+            settings['revision_of']=file
+            settings.update(metadata(file,record,groups))
+            source=record['source']
+            if not source.isalnum() or not (data/(source+'.mp4')).exists():
+                raise HTTPException(409,'A saved source is missing; no clips were changed.')
+            settings['id']=source
+            # Validate all inputs synchronously before scheduling any work.
+            from layouts import geometry
+            try:
+                geometry(settings.get('layout','stack'),settings.get('top',.32))
+                if settings.get('caption_style','gta') not in ('gta','bold','clean','hormozi','mrbeast'):raise ValueError()
+                if not 400<=int(settings.get('caption_y',1450))<=1750:raise ValueError()
+                for key in ('cam','game'):
+                    vals=[float(settings[key][k]) for k in ('x','y','w','h')]
+                    if not all(map(math.isfinite,vals)) or min(vals)<0 or min(vals[2:])<.01:raise ValueError()
+                for word in settings['words']:
+                    a,z=float(word['start']),float(word['end'])
+                    if not math.isfinite(a) or not math.isfinite(z) or not 0<=a<z<=settings['end']-settings['start']+.1:raise ValueError()
+                    if not isinstance(word['text'],str):raise ValueError()
+            except (ValueError,KeyError,TypeError,OverflowError):raise HTTPException(400,'Check layout, caption timings and crop regions.')
+            prepared.append((file,record,settings))
+        job=uuid.uuid4().hex
+        save(job,{'id':job,'kind':'reedit','status':'running','stage':'Applying saved edits','progress':0,'clips':[],
+                  'reused':{'download':True,'highlights':True,'transcript':True},'total':len(prepared)})
+        def work():
+            began=time.monotonic();clips=[]
+            try:
+                for i,(file,old,settings) in enumerate(prepared):
+                    child=export(settings)['job']
+                    while state.get(child,{}).get('status')=='running':time.sleep(.2)
+                    result=state[child]
+                    if result['status']!='done':raise RuntimeError(result.get('error','Export failed'))
+                    old['superseded_by']=child
+                    path=data/(file+'.json');temp=path.with_suffix('.json.tmp')
+                    temp.write_text(json.dumps(old,ensure_ascii=False,indent=2),encoding='utf-8');temp.replace(path)
+                    clips.append({'file':child,'previous':file,'title':settings.get('title','Edited clip'),'srt':result.get('srt')})
+                    save(job,{'clips':clips,'progress':(i+1)/len(prepared),'stage':f'Updated {i+1}/{len(prepared)}'})
+                save(job,{'status':'done','stage':'Edits applied','elapsed_seconds':round(time.monotonic()-began,2)})
+            except Exception as error:save(job,{'status':'error','error':str(error)[-600:]})
+        threading.Thread(target=work,daemon=True).start()
+        return {'job':job,'clips':len(prepared)}
